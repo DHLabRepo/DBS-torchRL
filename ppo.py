@@ -1,6 +1,7 @@
 """
 순수 PyTorch PPO 구현 (Full GPU).
-모든 데이터가 GPU 텐서로 처리됩니다. CPU-GPU 전송 없음.
+SB3의 MultiInputPolicy (MLP 기반 CombinedExtractor) 재현.
+모든 데이터가 GPU 텐서로 처리됩니다.
 """
 
 import torch
@@ -15,68 +16,80 @@ CH = 8
 
 
 # ============================================================================
-# Feature Extractor
+# Feature Extractor (SB3의 CombinedExtractor 재현 - MLP 기반)
 # ============================================================================
 
-class NatureCNN(nn.Module):
-    def __init__(self, in_channels, features_dim=256):
+# SB3의 CombinedExtractor는 4D shape에 대해 nn.Flatten()을 사용합니다.
+# 각 관측 키를 flatten 후 concat하여 하나의 벡터로 만듭니다.
+#
+# 각 키의 flattened 크기:
+#   state_record: 1*8*256*256 = 524,288
+#   state:        1*8*256*256 = 524,288
+#   pre_model:    1*8*256*256 = 524,288
+#   recon_image:  1*1*256*256 = 65,536
+#   target_image: 1*1*256*256 = 65,536
+#   총 concat 크기: 1,703,936
+
+OBS_KEYS = ["state_record", "state", "pre_model", "recon_image", "target_image"]
+
+# 각 키의 채널 수
+OBS_CHANNELS = {
+    "state_record": CH,   # 8
+    "state":        CH,   # 8
+    "pre_model":    CH,   # 8
+    "recon_image":  1,
+    "target_image": 1,
+}
+
+
+class CombinedExtractor(nn.Module):
+    """
+    SB3의 CombinedExtractor와 동일.
+    각 Dict 관측 키를 Flatten 후 concat합니다.
+    4D shape (1, C, H, W)은 is_image_space=False이므로 MLP(Flatten) 사용.
+    """
+    def __init__(self):
         super().__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4, padding=0),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
-        with torch.no_grad():
-            dummy = torch.zeros(1, in_channels, IPS, IPS)
-            n_flatten = self.cnn(dummy).shape[1]
-        self.linear = nn.Sequential(
-            nn.Linear(n_flatten, features_dim),
-            nn.ReLU(),
-        )
+        self.flatten = nn.Flatten()
 
-    def forward(self, x):
-        return self.linear(self.cnn(x))
-
-
-class MultiInputFeatureExtractor(nn.Module):
-    def __init__(self, features_dim_per_key=64):
-        super().__init__()
-        self.extractors = nn.ModuleDict({
-            "state_record": NatureCNN(CH, features_dim_per_key),
-            "state":        NatureCNN(CH, features_dim_per_key),
-            "pre_model":    NatureCNN(CH, features_dim_per_key),
-            "recon_image":  NatureCNN(1, features_dim_per_key),
-            "target_image": NatureCNN(1, features_dim_per_key),
-        })
-        self.features_dim = features_dim_per_key * 5
+        # 총 concat 크기 계산
+        self.features_dim = 0
+        for key in OBS_KEYS:
+            c = OBS_CHANNELS[key]
+            self.features_dim += 1 * c * IPS * IPS  # shape = (1, C, IPS, IPS)
 
     def forward(self, obs_dict):
         features = []
-        for key in ["state_record", "state", "pre_model", "recon_image", "target_image"]:
-            x = obs_dict[key]
-            if x.dim() == 5:
-                x = x.squeeze(1)
-            features.append(self.extractors[key](x.float()))
+        for key in OBS_KEYS:
+            x = obs_dict[key].float()
+            # (B, 1, C, H, W) -> (B, 1*C*H*W)
+            features.append(self.flatten(x))
         return torch.cat(features, dim=-1)
 
 
 # ============================================================================
-# Actor-Critic Policy
+# Actor-Critic Policy (MLP 기반)
 # ============================================================================
 
 class ActorCriticPolicy(nn.Module):
-    def __init__(self, features_dim_per_key=64, net_arch_pi=None, net_arch_vf=None):
-        super().__init__()
-        self.feature_extractor = MultiInputFeatureExtractor(features_dim_per_key)
-        features_dim = self.feature_extractor.features_dim
-        num_actions = CH * IPS * IPS
+    """
+    SB3 MultiInputPolicy 재현 (MLP 기반).
+    CombinedExtractor(Flatten+concat) → 공유 없는 별도 Actor/Critic MLP.
 
+    SB3 기본 net_arch: dict(pi=[64, 64], vf=[64, 64])
+    → 각각 별도의 2-layer MLP
+    """
+    def __init__(self, net_arch_pi=None, net_arch_vf=None):
+        super().__init__()
+
+        self.feature_extractor = CombinedExtractor()
+        features_dim = self.feature_extractor.features_dim
+        num_actions = CH * IPS * IPS  # 524288
+
+        # Actor 네트워크 (SB3 기본: [64, 64])
         if net_arch_pi is None:
-            net_arch_pi = [256, 256]
+            net_arch_pi = [64, 64]
+
         pi_layers = []
         prev_dim = features_dim
         for hidden_dim in net_arch_pi:
@@ -86,8 +99,10 @@ class ActorCriticPolicy(nn.Module):
         pi_layers.append(nn.Linear(prev_dim, num_actions))
         self.actor = nn.Sequential(*pi_layers)
 
+        # Critic 네트워크 (SB3 기본: [64, 64])
         if net_arch_vf is None:
-            net_arch_vf = [256, 256]
+            net_arch_vf = [64, 64]
+
         vf_layers = []
         prev_dim = features_dim
         for hidden_dim in net_arch_vf:
@@ -123,8 +138,6 @@ class ActorCriticPolicy(nn.Module):
 # Rollout Buffer (Full GPU)
 # ============================================================================
 
-OBS_KEYS = ["state_record", "state", "pre_model", "recon_image", "target_image"]
-
 class RolloutBuffer:
     """
     PPO 롤아웃 버퍼 (Full GPU).
@@ -136,7 +149,7 @@ class RolloutBuffer:
         self.gamma = gamma
         self.gae_lambda = gae_lambda
 
-        self.obs_list = []       # list of dict{str: GPU tensor}
+        self.obs_list = []
         self.actions = torch.zeros(n_steps, dtype=torch.long, device=device)
         self.rewards = torch.zeros(n_steps, dtype=torch.float32, device=device)
         self.dones = torch.zeros(n_steps, dtype=torch.float32, device=device)
@@ -148,7 +161,6 @@ class RolloutBuffer:
         self.pos = 0
 
     def add(self, obs, action, reward, done, log_prob, value):
-        """obs는 GPU 텐서 dict. clone하여 저장."""
         cloned_obs = {k: v.clone() for k, v in obs.items()}
         self.obs_list.append(cloned_obs)
         self.actions[self.pos] = action
@@ -162,7 +174,6 @@ class RolloutBuffer:
         return self.pos >= self.n_steps
 
     def compute_returns_and_advantages(self, last_value, last_done):
-        """GAE 계산 (GPU 텐서)"""
         advantages = torch.zeros(self.pos, device=self.device)
         last_gae_lam = 0.0
 
@@ -182,14 +193,11 @@ class RolloutBuffer:
         self.returns = advantages + self.values[:self.pos]
 
     def get_samples(self, batch_size):
-        """미니배치 생성 (모든 데이터 GPU)"""
         indices = torch.randperm(self.pos, device=self.device)
 
-        # 관측값을 key별로 미리 stack (1회만 수행)
         stacked_obs = {}
         for key in OBS_KEYS:
             stacked_obs[key] = torch.stack([self.obs_list[i][key] for i in range(self.pos)])
-            # (n_steps, 1, C, H, W) → squeeze dim=1 불필요 (get_samples에서 배치로 사용)
 
         for start in range(0, self.pos, batch_size):
             end = min(start + batch_size, self.pos)
@@ -260,7 +268,6 @@ class PPO:
         self.n_updates = 0
 
     def collect_step(self, obs, env):
-        """obs는 GPU 텐서 dict. 배치 차원 추가 후 policy에 전달."""
         obs_batched = {k: v.unsqueeze(0) if v.dim() == 4 else v for k, v in obs.items()}
 
         with torch.no_grad():

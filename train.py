@@ -106,8 +106,8 @@ env = BinaryHologramEnv(
 # ============================================================================
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# 정책 네트워크 생성
-policy = ActorCriticPolicy(features_dim_per_key=64)
+# 정책 네트워크 생성 (SB3 기본과 동일: MLP [64,64])
+policy = ActorCriticPolicy()
 
 # 파라미터 수 출력
 total_params = sum(p.numel() for p in policy.parameters())
