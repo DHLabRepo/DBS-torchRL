@@ -207,7 +207,9 @@ try:
 
             obs = next_obs
 
-        # 에피소드 종료
+        # 에피소드 종료 - 버퍼 잔여 obs 메모리 해제
+        ppo.buffer.flush()
+
         episode_count += 1
         episode_rewards.append(episode_reward)
 

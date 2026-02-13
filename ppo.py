@@ -135,16 +135,14 @@ class ActorCriticPolicy(nn.Module):
 
 
 # ============================================================================
-# Rollout Buffer (관측값은 CPU 저장, 학습 시 GPU 전송)
+# Rollout Buffer (Full GPU)
 # ============================================================================
 
 class RolloutBuffer:
     """
-    PPO 롤아웃 버퍼.
-    관측값(obs)은 CPU에 저장하여 GPU 메모리 절약.
-    (512 스텝 × 5 obs × ~6.5MB = ~3.3GB GPU 메모리 절약)
-    학습(get_samples) 시에만 미니배치를 GPU로 전송.
-    스칼라 값(action, reward, done 등)은 GPU 유지.
+    PPO 롤아웃 버퍼 (Full GPU).
+    모든 데이터를 GPU 텐서로 저장.
+    에피소드 종료 시 flush()로 잔여 메모리 해제.
     """
     def __init__(self, n_steps, device="cuda", gamma=0.99, gae_lambda=0.95):
         self.n_steps = n_steps
@@ -152,7 +150,7 @@ class RolloutBuffer:
         self.gamma = gamma
         self.gae_lambda = gae_lambda
 
-        self.obs_list = []       # list of dict{str: CPU tensor}
+        self.obs_list = []
         self.actions = torch.zeros(n_steps, dtype=torch.long, device=device)
         self.rewards = torch.zeros(n_steps, dtype=torch.float32, device=device)
         self.dones = torch.zeros(n_steps, dtype=torch.float32, device=device)
@@ -164,9 +162,8 @@ class RolloutBuffer:
         self.pos = 0
 
     def add(self, obs, action, reward, done, log_prob, value):
-        # GPU 텐서 → CPU로 이동하여 저장 (GPU 메모리 절약)
-        cpu_obs = {k: v.detach().cpu() for k, v in obs.items()}
-        self.obs_list.append(cpu_obs)
+        cloned_obs = {k: v.clone() for k, v in obs.items()}
+        self.obs_list.append(cloned_obs)
         self.actions[self.pos] = action
         self.rewards[self.pos] = reward
         self.dones[self.pos] = float(done)
@@ -197,26 +194,24 @@ class RolloutBuffer:
         self.returns = advantages + self.values[:self.pos]
 
     def get_samples(self, batch_size):
-        """미니배치 생성: CPU obs를 배치 단위로 GPU 전송"""
-        indices = torch.randperm(self.pos, device='cpu')  # CPU에서 인덱싱
+        indices = torch.randperm(self.pos, device=self.device)
+
+        stacked_obs = {}
+        for key in OBS_KEYS:
+            stacked_obs[key] = torch.stack([self.obs_list[i][key] for i in range(self.pos)])
 
         for start in range(0, self.pos, batch_size):
             end = min(start + batch_size, self.pos)
             batch_idx = indices[start:end]
 
-            # 미니배치만 GPU로 전송
-            batch_obs = {}
-            for key in OBS_KEYS:
-                batch_obs[key] = torch.stack(
-                    [self.obs_list[i][key] for i in batch_idx]
-                ).to(self.device, non_blocking=True)
+            batch_obs = {key: stacked_obs[key][batch_idx] for key in OBS_KEYS}
 
             yield (
                 batch_obs,
-                self.actions[batch_idx.to(self.device)],
-                self.log_probs[batch_idx.to(self.device)],
-                self.advantages[batch_idx.to(self.device)],
-                self.returns[batch_idx.to(self.device)],
+                self.actions[batch_idx],
+                self.log_probs[batch_idx],
+                self.advantages[batch_idx],
+                self.returns[batch_idx],
             )
 
     def reset(self):
@@ -229,6 +224,12 @@ class RolloutBuffer:
         self.advantages = None
         self.returns = None
         self.pos = 0
+
+    def flush(self):
+        """에피소드 종료 시 잔여 obs 메모리 해제"""
+        self.obs_list.clear()
+        self.pos = 0
+        torch.cuda.empty_cache()
 
 
 # ============================================================================
@@ -295,14 +296,13 @@ class PPO:
         return next_obs, done, reward, info
 
     def update(self):
-        last_obs = self.buffer.obs_list[-1]  # CPU tensor dict
+        last_obs = self.buffer.obs_list[-1]
         last_done = self.buffer.dones[self.buffer.pos - 1].item() > 0.5
 
         if last_done:
             last_value = 0.0
         else:
-            # CPU → GPU 전송 후 배치 차원 추가
-            obs_batched = {k: v.to(self.device).unsqueeze(0) if v.dim() == 4 else v.to(self.device) for k, v in last_obs.items()}
+            obs_batched = {k: v.unsqueeze(0) if v.dim() == 4 else v for k, v in last_obs.items()}
             with torch.no_grad():
                 if self.use_amp:
                     with autocast():
