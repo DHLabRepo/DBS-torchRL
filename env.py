@@ -108,6 +108,7 @@ class BinaryHologramEnv:
 
             # 배치 시뮬레이션
             result_batch = self._simulate(batch_states, z)
+            del batch_states  # 중간 텐서 즉시 해제
 
             # 배치 PSNR 계산
             target_expanded = self.target_image.expand(cur_batch, -1, -1, -1)
@@ -117,6 +118,9 @@ class BinaryHologramEnv:
                 psnr_changes[start + i] = change
                 if change > 0:
                     positive_psnr_sum += float(change)
+
+            del result_batch, target_expanded  # 메모리 해제
+            torch.cuda.empty_cache()
 
         # 다항식 보상 함수 (CPU numpy로 계산 후 GPU로)
         step_poly = np.array([num_samples, num_samples*90/100, num_samples*80/100, num_samples*50/100, num_samples*25/100, 1])
