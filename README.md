@@ -1,3 +1,23 @@
+```
+git clone git@github.com:DHLabRepo/DBS-torchRL.git
+
+cd DBS-torchRL
+
+mkdir -p result_v
+
+cp -r "/home/songyb111/20260116/Direct-Binary-Search-Reinforcement-Learning/result_v/2024-12-19 20:37:52.499731_pre_reinforce_8_0.002" result_v/
+
+cp -r "/home/songyb111/20260116/Direct-Binary-Search-Reinforcement-Learning/dataset6" .
+
+git clone git@github.com:DHLabRepo/torchOptics.git
+
+cd torchOptics
+
+git reset --hard 8e50d6a
+
+.
+```
+
 # DBS-torchRL
 
 Direct Binary Search (DBS) 강화학습의 **순수 PyTorch 구현**입니다.
