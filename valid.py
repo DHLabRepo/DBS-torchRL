@@ -36,7 +36,11 @@ warnings.filterwarnings('ignore')
 
 current_date = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-torch.backends.cudnn.enabled = False
+# GPU 최적화 설정
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 # ============================================================================
 # BinaryNet 모델 초기화 및 로드
@@ -73,8 +77,8 @@ model.eval()
 # ============================================================================
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# 정책 네트워크 생성 (학습 때와 동일한 구조)
-policy = ActorCriticPolicy(features_dim_per_key=64)
+# 정책 네트워크 생성 (학습 때와 동일한 구조 - 확장된 네트워크)
+policy = ActorCriticPolicy(features_dim_per_key=128)
 
 ppo_model_path = "./ppo_pytorch_models/ppo_latest.pt"
 ppo = PPO.load(ppo_model_path, policy=policy, device=device)
@@ -89,7 +93,8 @@ env = BinaryHologramEnv(
     T_PSNR=30,
     T_steps=1,
     T_PSNR_DIFF=1,
-    num_samples=1000
+    num_samples=1000,
+    importance_batch_size=64,
 )
 
 # ============================================================================

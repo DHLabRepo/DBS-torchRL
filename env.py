@@ -30,8 +30,14 @@ class BinaryHologramEnv:
     Binary Hologram 환경 클래스.
     gymnasium 의존성 없이 순수 Python으로 구현.
     reset()과 step() 인터페이스는 기존과 동일하게 유지.
+
+    GPU 최적화:
+    - state를 GPU 텐서로 유지하여 CPU-GPU 전송 최소화
+    - _calculate_pixel_importance를 배치 시뮬레이션으로 병렬 처리
+    - step()에서 in-place 픽셀 플립으로 텐서 재생성 방지
     """
-    def __init__(self, target_function, trainloader, max_steps=10000, T_PSNR=30, T_steps=1, T_PSNR_DIFF=1/4, num_samples=10000):
+    def __init__(self, target_function, trainloader, max_steps=10000, T_PSNR=30, T_steps=1, T_PSNR_DIFF=1/4, num_samples=10000,
+                 importance_batch_size=64):
 
         # 행동 공간 크기: 픽셀 하나를 선택하는 인덱스 (CH * IPS * IPS)
         self.num_pixels = CH * IPS * IPS
@@ -49,9 +55,14 @@ class BinaryHologramEnv:
         self.num_samples = num_samples
         self.target_step = self.T_PSNR_DIFF_o * self.num_samples
 
+        # GPU 배치 시뮬레이션 배치 크기
+        self.importance_batch_size = importance_batch_size
+
         # 학습 상태 초기화
-        self.state = None
-        self.state_record = None
+        self.state = None           # GPU 텐서 (1, CH, IPS, IPS) float32
+        self.state_np = None        # CPU numpy (관측용 캐시)
+        self.state_record = None    # CPU numpy
+        self.state_record_gpu = None  # GPU 텐서
         self.observation = None
         self.steps = None
         self.psnr_sustained_steps = None
@@ -75,44 +86,74 @@ class BinaryHologramEnv:
         # 에피소드 카운트
         self.episode_num_count = 0
 
-    def _calculate_pixel_importance(self, binary, z):
-        """랜덤으로 1만 개 픽셀 플립 후 PSNR 변화량을 순위화 및 양수 변화량 총합 계산"""
+        # 광학 시뮬레이션 메타
+        self.meta = {'dx': (7.56e-6, 7.56e-6), 'wl': 515e-9}
+
+    def _simulate_and_psnr(self, binary_state, z=2e-3):
+        """
+        광학 시뮬레이션 + PSNR 계산 헬퍼.
+        binary_state: (B, CH, IPS, IPS) GPU 텐서
+        Returns: result (B, 1, IPS, IPS), psnr (scalar or tensor)
+        """
+        binary_tt = tt.Tensor(binary_state, meta=self.meta)
+        sim = tt.simulate(binary_tt, z).abs() ** 2
+        result = torch.mean(sim, dim=1, keepdim=True)
+        return result
+
+    def _calculate_pixel_importance(self, z):
+        """
+        배치 시뮬레이션으로 픽셀 중요도 계산.
+        기존: 10000개 픽셀을 하나씩 순차 시뮬레이션 (매우 느림)
+        최적화: importance_batch_size개씩 묶어서 배치 시뮬레이션 (GPU 병렬 처리)
+        """
         num_samples = self.num_samples
-        psnr_changes = []
-        positive_psnr_sum = 0  # 양수 PSNR 변화량 총합 초기화
+        batch_size = self.importance_batch_size
 
-        for _ in range(num_samples):
-            random_action = np.random.randint(self.num_pixels)
-            channel, pixel_index = divmod(random_action, IPS * IPS)
-            row, col = divmod(pixel_index, IPS)
+        # 랜덤 픽셀 인덱스 생성
+        random_actions = np.random.randint(0, self.num_pixels, size=num_samples)
+        channels = random_actions // (IPS * IPS)
+        pixel_indices = random_actions % (IPS * IPS)
+        rows = pixel_indices // IPS
+        cols = pixel_indices % IPS
 
-            # 픽셀 플립
-            self.state[0, channel, row, col] = 1 - self.state[0, channel, row, col]
+        psnr_changes = np.zeros(num_samples, dtype=np.float64)
+        positive_psnr_sum = 0.0
 
-            binary_temp = torch.tensor(self.state, dtype=torch.float32).cuda()
-            binary_temp = tt.Tensor(binary_temp, meta={'dx': (7.56e-6, 7.56e-6), 'wl': 515e-9})
+        # 배치 단위로 처리
+        for start in range(0, num_samples, batch_size):
+            end = min(start + batch_size, num_samples)
+            cur_batch = end - start
 
-            sim_temp = tt.simulate(binary_temp, z).abs() ** 2
-            result_temp = torch.mean(sim_temp, dim=1, keepdim=True)
-            psnr_temp = tt.relativeLoss(result_temp, self.target_image, tm.get_PSNR)
+            # 현재 state를 배치만큼 복제 (cur_batch, CH, IPS, IPS)
+            batch_states = self.state.expand(cur_batch, -1, -1, -1).clone()
 
-            psnr_change = psnr_temp - self.initial_psnr
-            psnr_changes.append(psnr_change)
+            # 각 복제본에서 해당 픽셀 플립
+            for i in range(cur_batch):
+                idx = start + i
+                c, r, co = int(channels[idx]), int(rows[idx]), int(cols[idx])
+                batch_states[i, c, r, co] = 1.0 - batch_states[i, c, r, co]
 
-            # 양수 PSNR 변화량만 누적
-            if psnr_change > 0:
-                positive_psnr_sum += psnr_change
+            # 배치 시뮬레이션 수행
+            batch_tt = tt.Tensor(batch_states, meta=self.meta)
+            sim_batch = tt.simulate(batch_tt, z).abs() ** 2
+            result_batch = torch.mean(sim_batch, dim=1, keepdim=True)  # (cur_batch, 1, IPS, IPS)
 
-            # 상태 롤백
-            self.state[0, channel, row, col] = 1 - self.state[0, channel, row, col]
+            # 배치 PSNR 계산 (각 배치 요소별)
+            target_expanded = self.target_image.expand(cur_batch, -1, -1, -1)
+            for i in range(cur_batch):
+                psnr_val = tt.relativeLoss(result_batch[i:i+1], target_expanded[i:i+1], tm.get_PSNR)
+                change = psnr_val - self.initial_psnr
+                psnr_changes[start + i] = float(change)
+                if change > 0:
+                    positive_psnr_sum += float(change)
 
+        # 다항식 보상 함수 계산
         step_poly = np.array([num_samples, num_samples*90/100, num_samples*80/100, num_samples*50/100, num_samples*25/100, 1])
         rewards_poly = np.array([-0.5, -0.48, -0.45, -0.35, 0, 1])
-        degree_poly = len(step_poly) - 1  # degree = 5
+        degree_poly = len(step_poly) - 1
         coefficients_poly = np.polyfit(step_poly, rewards_poly, degree_poly)
         poly_reward = np.poly1d(coefficients_poly)
 
-        # 기본값(내장 문자열 표현)으로 다항식 보상 함수 출력
         print("Polynomial Reward Function Equation:")
         print(poly_reward)
 
@@ -124,7 +165,7 @@ class BinaryHologramEnv:
             x_val = num_samples - (num_samples - 1) * (rank / (num_samples - 1))
             importance_ranks[idx] = poly_reward(x_val)
 
-        return psnr_changes, importance_ranks, positive_psnr_sum
+        return psnr_changes.tolist(), importance_ranks, positive_psnr_sum
 
     def reset(self, seed=None, options=None, z=2e-3):
         torch.cuda.empty_cache()
@@ -155,24 +196,23 @@ class BinaryHologramEnv:
         self.psnr_sustained_steps = 0
         self.next_print_thresholds = 0
 
-        self.state = (self.observation >= 0.5).astype(np.int8)  # 초기 Binary state
-        self.state_record = np.zeros_like(self.state)  # 플립 횟수를 저장하기 위한 배열 초기화
+        # state를 GPU 텐서로 유지
+        self.state = (model_output >= 0.5).float().cuda()  # (1, CH, IPS, IPS) GPU
+        self.state_np = self.state.cpu().numpy().astype(np.int8)
+        self.state_record = np.zeros_like(self.state_np)
+        self.state_record_gpu = torch.zeros_like(self.state)  # GPU
 
-        binary = torch.tensor(self.state, dtype=torch.float32).cuda()
-        binary = tt.Tensor(binary, meta={'dx': (7.56e-6, 7.56e-6), 'wl': 515e-9})
-
-        # 시뮬레이션
-        sim = tt.simulate(binary, z).abs()**2
-        result = torch.mean(sim, dim=1, keepdim=True)
+        # 시뮬레이션 (GPU 텐서 직접 사용)
+        result = self._simulate_and_psnr(self.state, z)
 
         # MSE 및 PSNR 계산
         mse = tt.relativeLoss(result, self.target_image, F.mse_loss).detach().cpu().numpy()
         self.initial_psnr = tt.relativeLoss(result, self.target_image, tm.get_PSNR)
         self.previous_psnr = self.initial_psnr
 
-        # 1만 개 픽셀 플립 후 PSNR 변화량 순위화 및 양수 변화량 총합 계산
+        # 배치 시뮬레이션으로 픽셀 중요도 계산 (GPU 병렬)
         rw_start_time = time.time()
-        self.psnr_change_list, self.importance_ranks, positive_psnr_sum = self._calculate_pixel_importance(binary, z)
+        self.psnr_change_list, self.importance_ranks, positive_psnr_sum = self._calculate_pixel_importance(z)
         data_processing_time = time.time() - rw_start_time
         print(
             f"\nTime taken for psnr_change_list: {data_processing_time:.2f} seconds"
@@ -182,7 +222,7 @@ class BinaryHologramEnv:
         print(f"\033[94m[Dynamic Threshold] T_PSNR_DIFF set to: {self.T_PSNR_DIFF:.6f}\033[0m")
 
         obs = {"state_record": self.state_record,
-               "state": self.state,
+               "state": self.state_np,
                "pre_model": self.observation,
                "recon_image": result.cpu().numpy(),
                "target_image": self.target_image_np,
@@ -198,7 +238,7 @@ class BinaryHologramEnv:
 
         self.total_start_time = time.time()
 
-        return obs, {"state": self.state}
+        return obs, {"state": self.state_np}
 
     def step(self, action, z=2e-3):
         self.steps += 1
@@ -209,21 +249,22 @@ class BinaryHologramEnv:
         row = pixel_index // IPS
         col = pixel_index % IPS
 
-        # 상태 변경
-        self.state[0, channel, row, col] = 1 - self.state[0, channel, row, col]
-        self.state_record[0, channel, row, col] = self.state_record[0, channel, row, col] + 1
+        # GPU 텐서에서 직접 in-place 픽셀 플립 (CPU-GPU 전송 없음)
+        self.state[0, channel, row, col] = 1.0 - self.state[0, channel, row, col]
+        self.state_record_gpu[0, channel, row, col] += 1.0
 
         self.flip_count += 1
 
-        # 시뮬레이션 수행
-        binary_after = torch.tensor(self.state, dtype=torch.float32).cuda()
-        binary_after = tt.Tensor(binary_after, meta={'dx': (7.56e-6, 7.56e-6), 'wl': 515e-9})
-        sim_after = tt.simulate(binary_after, z).abs()**2
-        result_after = torch.mean(sim_after, dim=1, keepdim=True)
+        # GPU 텐서로 직접 시뮬레이션 (tensor 재생성 없음)
+        result_after = self._simulate_and_psnr(self.state, z)
         psnr_after = tt.relativeLoss(result_after, self.target_image, tm.get_PSNR)
 
+        # 관측값 생성 (numpy 변환은 관측 반환 시에만)
+        self.state_np = self.state.cpu().numpy().astype(np.int8)
+        self.state_record = self.state_record_gpu.cpu().numpy().astype(np.int8)
+
         obs = {"state_record": self.state_record,
-               "state": self.state,
+               "state": self.state_np,
                "pre_model": self.observation,
                "recon_image": result_after.cpu().numpy(),
                "target_image": self.target_image_np,
@@ -237,9 +278,10 @@ class BinaryHologramEnv:
         closest_index = np.argmin(np.abs(np.array(self.psnr_change_list) - psnr_change))
         reward = self.importance_ranks[closest_index]
 
-        # psnr_change가 음수인 경우 상태 롤백 수행
+        # psnr_change가 음수인 경우 상태 롤백 수행 (GPU에서 직접)
         if psnr_change < 0:
-            self.state[0, channel, row, col] = 1 - self.state[0, channel, row, col]
+            self.state[0, channel, row, col] = 1.0 - self.state[0, channel, row, col]
+            self.state_record_gpu[0, channel, row, col] -= 1.0
             self.flip_count -= 1
 
             return obs, reward, False, False, {}
@@ -274,7 +316,6 @@ class BinaryHologramEnv:
             self.psnr_sustained_steps += 1
 
             if self.psnr_sustained_steps >= self.T_steps and psnr_diff >= self.T_PSNR_DIFF:
-                # 스텝에 따른 추가 보상 계산 (선형 보상)
                 m = -1000 / (3 * self.target_step)
                 additional_reward = 100 + m * (self.steps - (2 / 5) * self.target_step)
                 reward += additional_reward
@@ -288,7 +329,6 @@ class BinaryHologramEnv:
                 f"\nFlip Pixel: Channel={channel}, Row={row}, Col={col}"
                 f"\nTime taken for this data: {data_processing_time:.2f} seconds"
             )
-            # 스텝에 따른 추가 보상 계산 (선형 보상)
             m = -1000 / (3 * self.target_step)
             additional_reward = 100 + m * (self.steps - (2 / 5) * self.target_step)
             reward += additional_reward

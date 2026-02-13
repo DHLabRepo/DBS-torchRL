@@ -36,7 +36,21 @@ warnings.filterwarnings('ignore')
 
 current_date = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-torch.backends.cudnn.enabled = False
+# ============================================================================
+# GPU 최적화 설정
+# ============================================================================
+# cuDNN 활성화 (기존 코드에서는 False로 비활성화되어 있었음)
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True  # 입력 크기가 일정할 때 최적 알고리즘 자동 선택
+
+# TF32 활성화 (Ampere GPU 이상, RTX 4090 포함)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+print(f"cuDNN enabled: {torch.backends.cudnn.enabled}")
+print(f"cuDNN benchmark: {torch.backends.cudnn.benchmark}")
+print(f"TF32 matmul: {torch.backends.cuda.matmul.allow_tf32}")
+print(f"TF32 cuDNN: {torch.backends.cudnn.allow_tf32}")
 
 # ============================================================================
 # BinaryNet 모델 초기화 및 로드
@@ -60,8 +74,8 @@ padding = 0
 train_dataset = Dataset512(target_dir=target_dir, meta=meta, isTrain=True, padding=padding)
 valid_dataset = Dataset512(target_dir=valid_dir, meta=meta, isTrain=False, padding=padding)
 
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=2)
+valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=2)
 
 # ============================================================================
 # BinaryNet 사전학습 모델 로드
@@ -72,8 +86,10 @@ model.load_state_dict(torch.load('result_v/2024-12-19 20:37:52.499731_pre_reinfo
 model.eval()
 
 # ============================================================================
-# 환경 생성
+# 환경 생성 (GPU 배치 시뮬레이션 활성화)
 # ============================================================================
+# importance_batch_size: 픽셀 중요도 계산 시 한 번에 배치 처리할 픽셀 수
+# GPU VRAM 여유에 따라 조정 (RTX 4090 24GB 기준 64~128 권장)
 env = BinaryHologramEnv(
     target_function=model,
     trainloader=train_loader,
@@ -81,18 +97,24 @@ env = BinaryHologramEnv(
     T_PSNR=30,
     T_steps=1,
     T_PSNR_DIFF=1/4,
-    num_samples=10000
+    num_samples=10000,
+    importance_batch_size=64,  # GPU 배치 크기 (VRAM에 맞게 조정)
 )
 
 # ============================================================================
-# PPO 설정
+# PPO 설정 (확장된 네트워크 + AMP)
 # ============================================================================
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# 정책 네트워크 생성
-policy = ActorCriticPolicy(features_dim_per_key=64)
+# 정책 네트워크 생성 (확장: 64 -> 128 features per key)
+policy = ActorCriticPolicy(features_dim_per_key=128)
 
-# PPO 하이퍼파라미터 (기존 SB3 설정과 동일)
+# 파라미터 수 출력
+total_params = sum(p.numel() for p in policy.parameters())
+trainable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+print(f"\nPolicy Network Parameters: {total_params:,} total, {trainable_params:,} trainable")
+
+# PPO 하이퍼파라미터
 ppo_kwargs = dict(
     n_steps=512,
     batch_size=128,
@@ -104,6 +126,7 @@ ppo_kwargs = dict(
     vf_coef=0.5,
     ent_coef=0.01,
     max_grad_norm=0.5,
+    use_amp=True,  # Mixed Precision 활성화
 )
 
 # 저장 디렉토리
@@ -123,6 +146,24 @@ else:
     print("Starting training from scratch.")
     ppo = PPO(policy=policy, device=device, **ppo_kwargs)
 
+# torch.compile 적용 (PyTorch 2.0+, 선택적)
+try:
+    ppo.policy = torch.compile(ppo.policy, mode="reduce-overhead")
+    print("torch.compile applied to policy network (reduce-overhead mode)")
+except Exception as e:
+    print(f"torch.compile not available or failed: {e}")
+    print("Continuing without torch.compile")
+
+# ============================================================================
+# GPU 메모리 상태 출력
+# ============================================================================
+if torch.cuda.is_available():
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    total = torch.cuda.get_device_properties(0).total_mem / 1024**3
+    print(f"\nGPU Memory: {allocated:.2f}GB allocated / {reserved:.2f}GB reserved / {total:.2f}GB total")
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+
 # ============================================================================
 # 학습 루프
 # ============================================================================
@@ -134,9 +175,11 @@ global_step = 0
 episode_rewards = []
 
 print(f"\n{'='*60}")
-print(f"PPO Training Start")
+print(f"PPO Training Start (GPU Optimized)")
 print(f"Max Episodes: {max_episodes}")
 print(f"n_steps: {ppo_kwargs['n_steps']}, batch_size: {ppo_kwargs['batch_size']}")
+print(f"Mixed Precision (AMP): {ppo_kwargs['use_amp']}")
+print(f"features_dim_per_key: 128, net_arch: [512, 512]")
 print(f"{'='*60}\n")
 
 try:
@@ -171,11 +214,15 @@ try:
 
         print(f"\033[41mEpisode {episode_count}: Total Reward: {episode_reward:.2f}\033[0m")
 
+        # GPU 메모리 상태 주기적 출력 (50 에피소드마다)
+        if episode_count % 50 == 0 and torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            print(f"\033[93m[GPU] Memory allocated: {allocated:.2f}GB\033[0m")
+
         # 주기적으로 모델 저장 (10 에피소드마다)
         if episode_count % 10 == 0:
             ppo.save(ppo_model_path)
 
-        # 에피소드 수 도달 시 종료
         if episode_count >= max_episodes:
             print(f"Stopping training at episode {episode_count}")
             break
