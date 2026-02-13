@@ -1,4 +1,14 @@
-```
+# DBS-torchRL
+
+Direct Binary Search (DBS) 강화학습의 **순수 PyTorch 구현**입니다.
+
+기존 `Direct-Binary-Search-Reinforcement-Learning/` 프로젝트에서 `stable-baselines3`와 `gymnasium` 의존성을 완전히 제거하고, 동일한 로직을 PyTorch만으로 재구현하였습니다.
+
+---
+
+## 설치
+
+```bash
 git clone git@github.com:DHLabRepo/DBS-torchRL.git
 
 cd DBS-torchRL
@@ -14,15 +24,7 @@ git clone git@github.com:DHLabRepo/torchOptics.git
 cd torchOptics
 
 git reset --hard 8e50d6a
-
-.
 ```
-
-# DBS-torchRL
-
-Direct Binary Search (DBS) 강화학습의 **순수 PyTorch 구현**입니다.
-
-기존 `Direct-Binary-Search-Reinforcement-Learning/` 프로젝트에서 `stable-baselines3`와 `gymnasium` 의존성을 완전히 제거하고, 동일한 로직을 PyTorch만으로 재구현하였습니다.
 
 ---
 
@@ -42,9 +44,9 @@ Direct Binary Search (DBS) 강화학습의 **순수 PyTorch 구현**입니다.
 ```
 DBS-torchRL/
 ├── env.py          # 환경 (Full GPU, 배치 시뮬레이션)
-├── ppo.py          # 순수 PyTorch PPO (CNN + AMP)
+├── ppo.py          # 순수 PyTorch PPO (CNN + AMP + Full GPU Buffer)
 ├── models.py       # BinaryNet (U-Net) + Dataset512 (DIV2K 데이터 로더)
-├── train.py        # 학습 스크립트 (cuDNN + TF32 + torch.compile)
+├── train.py        # 학습 스크립트 (cuDNN + TF32 + torch.compile + TensorBoard)
 ├── valid.py        # 검증 스크립트
 ├── utils/
 │   └── logger.py   # 콘솔+파일 동시 로깅
@@ -78,7 +80,7 @@ DBS-torchRL/
 
 ### Feature Extractor: NatureCNN
 
-현재 구현은 각 관측 키별로 **NatureCNN** (3-layer Conv)을 사용합니다.
+각 관측 키별로 **NatureCNN** (3-layer Conv)을 사용합니다.
 
 > **참고**: 원래 SB3 코드의 관측 shape이 4D `(1, 8, 256, 256)`이라 SB3 내부에서는 `is_image_space=False`로 판단하여 **Flatten + MLP**를 사용합니다. 현재 코드는 CNN 기반이므로 원래 SB3 동작과 다릅니다.
 
@@ -121,20 +123,19 @@ Critic: 320 → 256 → 256 → 1       (Scalar Value)
 - `_get_obs()`: 변경되는 state/state_record는 `.clone()`, 불변인 pre_model/target_image는 참조
 - `psnr_change_tensor`, `importance_tensor`: GPU 텐서로 보상 계산
 - `state_record`는 음수 PSNR 시 롤백하지 않음 (원래 코드와 동일: 실패 플립도 기록)
-- 에피소드 종료 시 `buffer.flush()` + `torch.cuda.empty_cache()`로 메모리 해제
 
 ### 2. PPO (`ppo.py`) - AMP + Full GPU Buffer
 
-| 항목 | 기존 | 현재 |
-|------|------|------|
-| 연산 정밀도 | float32 | **Mixed Precision (AMP)** |
-| Feature Extractor | - | **NatureCNN × 5** (CNN 기반) |
-| `features_dim_per_key` | - | 64 |
-| Actor/Critic hidden | - | [256, 256] |
-| RolloutBuffer | numpy 리스트 | **GPU 텐서** |
-| GradScaler | 없음 | **`torch.cuda.amp.GradScaler`** |
+| 항목 | 설명 |
+|------|------|
+| 연산 정밀도 | Mixed Precision (AMP, float16 forward + float32 loss) |
+| Feature Extractor | NatureCNN × 5 (CNN 기반) |
+| `features_dim_per_key` | 64 |
+| Actor/Critic hidden | [256, 256] |
+| RolloutBuffer | GPU 텐서 clone 저장 |
+| GradScaler | `torch.cuda.amp.GradScaler` |
 
-### 3. 학습 (`train.py`) - cuDNN + TF32 + torch.compile
+### 3. 학습 (`train.py`)
 
 | 항목 | 기존 | 현재 |
 |------|------|------|
@@ -142,7 +143,47 @@ Critic: 320 → 256 → 256 → 1       (Scalar Value)
 | `cudnn.benchmark` | 미설정 | **True** |
 | TF32 | 미설정 | **활성화** (Ampere GPU) |
 | `torch.compile` | 없음 | **reduce-overhead** 모드 |
-| 에피소드 종료 시 | - | **`buffer.flush()`** 메모리 해제 |
+| 학습 모니터링 | 없음 | **TensorBoard** |
+
+---
+
+## TensorBoard
+
+학습 진행도를 실시간으로 확인할 수 있습니다.
+
+### 실행 방법
+
+```bash
+tensorboard --logdir=./ppo_tensorboard
+```
+
+브라우저에서 `http://localhost:6006` 접속.
+
+### 로깅 메트릭
+
+**loss/** (PPO 업데이트마다, 512 스텝당 1회)
+| 메트릭 | 설명 |
+|--------|------|
+| `policy_loss` | PPO 클립 정책 손실 |
+| `value_loss` | Critic MSE 손실 |
+| `entropy_loss` | 엔트로피 손실 (탐색 장려) |
+| `total_loss` | 가중 합산 손실 |
+
+**episode/** (에피소드 종료마다)
+| 메트릭 | 설명 |
+|--------|------|
+| `reward` | 에피소드 총 보상 |
+| `length` | 에피소드 스텝 수 |
+| `psnr_diff` | 최대 PSNR 향상량 |
+| `initial_psnr` | 초기 PSNR |
+| `final_psnr` | 최종 PSNR |
+| `flip_count` | 성공 플립 수 |
+| `success_ratio` | 플립 성공률 |
+
+**system/** (50 에피소드마다)
+| 메트릭 | 설명 |
+|--------|------|
+| `gpu_memory_gb` | GPU 메모리 사용량 |
 
 ---
 
@@ -190,6 +231,13 @@ python train.py
 - BinaryNet 사전학습 모델 경로를 `train.py`에서 수정 필요
 - 데이터셋 경로(`target_dir`, `valid_dir`)를 환경에 맞게 수정 필요
 - 학습된 PPO 모델은 `./ppo_pytorch_models/`에 저장됨
+- TensorBoard 로그는 `./ppo_tensorboard/`에 저장됨
+
+### 텐서보드 모니터링
+
+```bash
+tensorboard --logdir=./ppo_tensorboard
+```
 
 ### GPU 배치 크기 조정
 
