@@ -295,13 +295,14 @@ class PPO:
         return next_obs, done, reward, info
 
     def update(self):
-        last_obs = self.buffer.obs_list[-1]
+        last_obs = self.buffer.obs_list[-1]  # CPU tensor dict
         last_done = self.buffer.dones[self.buffer.pos - 1].item() > 0.5
 
         if last_done:
             last_value = 0.0
         else:
-            obs_batched = {k: v.unsqueeze(0) if v.dim() == 4 else v for k, v in last_obs.items()}
+            # CPU → GPU 전송 후 배치 차원 추가
+            obs_batched = {k: v.to(self.device).unsqueeze(0) if v.dim() == 4 else v.to(self.device) for k, v in last_obs.items()}
             with torch.no_grad():
                 if self.use_amp:
                     with autocast():
